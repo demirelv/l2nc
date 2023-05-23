@@ -44,7 +44,7 @@ struct pkt_elem {
 	TAILQ_ENTRY(pkt_elem) list;
 	int seq;
 	int id;
-	time_t time;
+	uint64_t time;
 	int retry;
 	int length;
 	int eof;
@@ -53,12 +53,26 @@ struct pkt_elem {
 
 static TAILQ_HEAD(pkt_list, pkt_elem) pkt_list = TAILQ_HEAD_INITIALIZER(pkt_list);
 static int dump_size = 1024 * 128;
+static int dl = 0;
+static char *fname = NULL;
+static FILE *fp = NULL;
+
+#define debug(arg...)				\
+	do {					\
+		if (dl) {			\
+			fprintf(stderr, arg);	\
+		}				\
+	} while(0)				\
 
 static int create_raw_socket(const char *ifname, const unsigned short proto)
 {
 	int sockfd = -1;
 	struct ifreq ifreq;
 	struct sockaddr_ll sockaddr;
+	struct timeval timeout;
+
+	timeout.tv_sec = 3;
+	timeout.tv_usec = 0;
 
 	sockfd = socket(PF_PACKET, SOCK_RAW, htons(proto));
 	if (sockfd < 0) {
@@ -71,6 +85,10 @@ static int create_raw_socket(const char *ifname, const unsigned short proto)
 	if (ioctl(sockfd, SIOCGIFINDEX, &ifreq) < 0) {
 		goto bail;
 	}
+
+	if (setsockopt (sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+			sizeof(timeout)) < 0)
+		perror("setsockopt failed");
 
 	memset(&sockaddr, 0, sizeof(sockaddr));
 	sockaddr.sll_family = AF_PACKET;
@@ -125,7 +143,7 @@ static int l2_send(int sockfd, uint32_t cmd, uint32_t id, uint32_t seq, const ui
 		usleep(ms * 1000);
 	rc = send(sockfd, p, s, MSG_NOSIGNAL);
 	if (rc != s) {
-		fprintf(stderr, "could not send %02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x proto:%04x, rc:%d error '%s'\n",
+		debug("could not send %02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x proto:%04x, rc:%d error '%s'\n",
 			p->header.ether.ether_shost[0], p->header.ether.ether_shost[1], p->header.ether.ether_shost[2],
 			p->header.ether.ether_shost[3], p->header.ether.ether_shost[4], p->header.ether.ether_shost[5],
 			p->header.ether.ether_dhost[0], p->header.ether.ether_dhost[1], p->header.ether.ether_dhost[2],
@@ -158,6 +176,22 @@ static int read_dump_buf(uint8_t **buf, int size, int *eof)
 	buffer = malloc(len);
 	if (buffer == NULL)
 		return -1;
+
+	if (fp != NULL) {
+		int rc = 0;
+
+		rc = fread(buffer, 1, len, fp);
+		if (rc != len) {
+			fprintf(stderr, "read file failed(%d)!\n", rc);
+		}
+		debug("read file len:%d \n", rc);
+		dump_size -= rc;
+		if (dump_size <= 0)
+			*eof = 1;
+		*buf = buffer;
+		return rc;
+	}
+
 	for (i = 0; i < len; i++) {
 		buffer[i] = i % 2 ? 0xAA : 0x55;
 	}
@@ -169,7 +203,16 @@ static int read_dump_buf(uint8_t **buf, int size, int *eof)
 	return len;
 }
 
-static struct pkt_elem *add_packet(uint8_t *buf, int size, int id, int seq, int eof)
+static uint64_t get_time_ms(void)
+{
+        uint64_t t;
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        t = ((uint64_t)ts.tv_sec * 1000) + ((uint64_t)ts.tv_nsec / 1000000);
+        return t;
+}
+
+static struct pkt_elem *add_packet(uint8_t *buf, int size, int id, int seq, int eof, uint64_t time)
 {
 	struct pkt_elem *p = NULL;
 
@@ -185,7 +228,7 @@ static struct pkt_elem *add_packet(uint8_t *buf, int size, int id, int seq, int 
 	p->id = id;
 	p->length = size;
 	p->eof = eof;
-	p->time = time(NULL);
+	p->time = time;
 	p->retry = 0;
 
 	TAILQ_INSERT_TAIL(&pkt_list, p, list);
@@ -225,17 +268,12 @@ static struct pkt_elem *get_packet_id(int id)
 	return NULL;
 }
 
-void usage(void)
-{
-	printf("l2nc\n");
-	exit(0);
-}
-
-void print_packet(struct packet *p)
+static void print_packet(struct packet *p)
 {
 	int i;
 
-	printf("%02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x proto %04x, len:%d, id:%d, seq:%d, eof:%d\n",
+	if (fp != NULL && dl)
+		printf("%02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x proto %04x, len:%d, id:%d, seq:%d, eof:%d\n",
 			p->header.ether.ether_shost[0],
 			p->header.ether.ether_shost[1],
 			p->header.ether.ether_shost[2],
@@ -249,6 +287,14 @@ void print_packet(struct packet *p)
 			p->header.ether.ether_dhost[4],
 			p->header.ether.ether_dhost[5], ntohs(p->header.ether.ether_type), p->header.len,
 			p->header.id, p->header.seq, p->header.eof);
+	if (fp != NULL) {
+		size_t l;
+		l = fwrite(p->data, 1, p->header.len, fp);
+		if (l != p->header.len) {
+			fprintf(stderr, "write file failed(%d)!\n", (int)l);
+		}
+		return;
+	}
 	for (i = 0; i < (int)p->header.len; i++) {
 		printf("%02x", p->data[i]);
 		if (i != 0 && i % 16 == 0)
@@ -259,15 +305,42 @@ void print_packet(struct packet *p)
 	printf("\n");
 }
 
+static void usage(void)
+{
+	printf("\n\n"
+		"usage: l2nc [-elah] [-i <interface name>]"
+		" [-p <protocol>] [-m <int>] [-t <ms>] [-s <byte>] [-w <ms>] [-r <int>]"
+		" [-b <byte>] [-d <mac addr>] [-f <file name>]"
+		"\n"
+		"options:\n"
+		"	-e	enable debug\n"
+		"	-i	interface name\n"
+		"	-p	protocol number\n"
+		"	-l	enable server\n"
+		"	-m	Simultaneous packet count\n"
+		"	-a	enable ack\n"
+		"	-t	timeout\n"
+		"	-s	size\n"
+		"	-w	re-send timeout(ms)\n"
+		"	-r	re-send count paket\n"
+		"	-b	packet size(byte)\n"
+		"	-d	destination mac address\n"
+		"	-f	file name\n"
+		"	-h	help\n"
+		"\n\n");
+	exit(0);
+}
+
 int main(int argc, char *argv[])
 {
 	int sockfd = -1;
 	char *ifname = "eth0";
 	uint16_t proto = 0x7070;
 	int serverflag = 0;
-	int timeout = 30;
+	int timeout = 1000;
 	int wait = 0;
 	int buffer_size = 1024;
+	int retry = 30;
 	uint8_t dhost[ETH_ALEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 	uint8_t ihost[ETH_ALEN];
 	struct pollfd fds;
@@ -281,14 +354,18 @@ int main(int argc, char *argv[])
 	struct pkt_elem *p = NULL;
 	struct pkt_elem *n = NULL;
 	int i = 0;
+	int simul = 0;
 	int waitack = 0;
 
 	signal(SIGPIPE, SIG_IGN);
 
 	while ((ch = getopt(argc, argv,
-		"i:p:ld:t:w:b:s:ha"))
+		"i:p:ld:t:w:b:s:r:ham:ef:"))
 		!= -1) {
 		switch (ch) {
+		case 'e':
+			dl = 1;
+			break;
 		case 'i':
 			ifname = optarg;
 			break;
@@ -297,6 +374,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'l':
 			serverflag = 1;
+			break;
+		case 'm':
+			simul = atoi(optarg);
 			break;
 		case 'a':
 			waitack = 1;
@@ -310,6 +390,9 @@ int main(int argc, char *argv[])
 		case 'w':
 			wait = atoi(optarg);
 			break;
+		case 'r':
+			retry = atoi(optarg);
+			break;
 		case 'b':
 			buffer_size = atoi(optarg);
 			break;
@@ -318,8 +401,11 @@ int main(int argc, char *argv[])
 						&dhost[0], &dhost[1], &dhost[2], &dhost[3],
 						&dhost[4], &dhost[5]) < 6) {
 					fprintf(stderr, "could not parse %s\n", optarg);
-				}
-				break;
+			}
+			break;
+		case 'f':
+			fname = strdup(optarg);
+			break;
 		case 'h':
 		default:
 			usage();
@@ -329,6 +415,20 @@ int main(int argc, char *argv[])
 
 	argc -= optind;
 	argv += optind;
+
+	if (fname != NULL) {
+		fp = fopen(fname, serverflag ? "w": "r");
+		if (fp == NULL) {
+			fprintf(stderr, "could not open file '%s'\n", fname);
+			goto out;
+		}
+		if (!serverflag) {
+			fseek(fp, 0, SEEK_END);
+			dump_size = ftell(fp);
+			fseek(fp, 0, SEEK_SET);
+			debug("file size:%d\n", dump_size);
+		}
+	}
 
 	sockfd = create_raw_socket(ifname, proto);
 	if (sockfd < 0)
@@ -343,30 +443,31 @@ int main(int argc, char *argv[])
 	memcpy(ihost, ifreq.ifr_hwaddr.sa_data, ETH_ALEN);
 
 	for (;;) {
-		int tm = timeout;
+		uint64_t tm = timeout;
 
 		fds.fd = sockfd;
 		fds.revents = 0;
 		fds.events = 0;
 		fds.events |= POLLIN;
-		fds.events |= POLLOUT;
+		fds.events |= POLLERR;
 
 		if (!serverflag) {
 			int count = 0;
 
-			TAILQ_FOREACH(p, &pkt_list, list) {
-				time_t ct = time(NULL);
+			TAILQ_FOREACH_SAFE(p, &pkt_list, list, n) {
+				uint64_t ct = get_time_ms();
 
 				count++;
 				if (p->time <= ct) {
-					if (p->retry > 30) {
-						fprintf(stderr, "Could not recive ack for %d\n", p->id);
-						goto out;
+					if (p->retry > retry) {
+						fprintf(stderr, "Could not recive ack for %d, retry:%d\n", p->id, p->retry);
+						remove_packet(p);
+						continue;
 					}
 					p->time = ct + timeout;
 					p->seq = seq++;
 					p->retry++;
-					fprintf(stderr, "resending %d, retry=%d seq=%d\n", p->id, p->retry, p->seq);
+					debug("resending %d, retry=%d seq=%d\n", p->id, p->retry, p->seq);
 					rc = l2_send(sockfd, PKT_CMD_DATA, p->id, p->seq, dhost, ihost, proto, p->data, p->length, p->eof, wait);
 					if (rc < 0)
 						goto out;
@@ -379,25 +480,27 @@ int main(int argc, char *argv[])
 				fprintf(stderr, "file transfer complete!\n");
 				break;
 			}
-			for (i = count; eof == 0 && i < (waitack ? 32 : 1); i++) {
+			for (i = count; eof == 0 && i < (simul ? simul : 1); i++) {
 				rc = read_dump_buf(&buf, buffer_size, &eof);
 				if (rc < 0)
 					goto out;
-
-				p = add_packet(buf, rc, id++, seq++, eof);
+				if (rc == 0)
+					break;
+				p = add_packet(buf, rc, id++, seq++, eof, get_time_ms() + timeout);
 				if (p == NULL)
 					goto out;
-
+				debug("sending %d, seq=%d\n", p->id, p->seq);
 				rc = l2_send(sockfd, PKT_CMD_DATA, p->id, p->seq, dhost, ihost, proto, p->data, p->length, eof, wait);
 				if (rc < 0)
 					goto out;
-
+				if (!waitack) {
+					remove_packet(p);
+				}
 				if (eof)
 					break;
 			}
 		}
-
-		rc = poll(&fds, 1, tm * 1000);
+		rc = poll(&fds, 1, tm);
 		if (rc < 0) {
 			if (errno == EINTR)
 				continue;
@@ -407,24 +510,17 @@ int main(int argc, char *argv[])
 		}
 		if (rc == 0)
 			continue;
-
 		if (fds.revents & POLLERR) {
 			fprintf(stderr, "something going wrong!\n");
 			break;
 		}
-		if ((fds.revents & POLLOUT) != 0) {
-			if (!waitack && serverflag) {
-				TAILQ_FOREACH_SAFE(p, &pkt_list, list, n) {
-					remove_packet(p);
-				}
-			}
-		}
+
 		if ((fds.revents & POLLIN) != 0) {
 			uint8_t data[1800];
 			struct packet *packet = (struct packet *)data;
 
 			rc = recv(fds.fd, data,
-						sizeof(data), MSG_DONTWAIT);
+				  sizeof(data), MSG_DONTWAIT);
 			if (rc < 0)
 				goto out;
 
@@ -437,11 +533,16 @@ int main(int argc, char *argv[])
 
 			if (!serverflag && packet->header.cmd == PKT_CMD_ACK) {
 				p = get_packet(packet->header.seq);
-				if (p != NULL)
+				if (p != NULL) {
+					debug("recv packet ack id:%d, seq:%d\n", p->id, p->seq);
 					remove_packet(p);
+				 } else {
+					debug("recv ack mismach req: %d\n", packet->header.seq);
+				 }
 
 			} else if (serverflag && packet->header.cmd == PKT_CMD_DATA) {
 				if (waitack) {
+					debug("send ack id:%d, req:%d\n", packet->header.id, packet->header.seq);
 					rc = l2_send(sockfd, PKT_CMD_ACK, packet->header.id, packet->header.seq, packet->header.ether.ether_shost, ihost, proto, NULL, 0, 0, 0);
 					if (rc < 0)
 						goto out;
@@ -470,7 +571,7 @@ int main(int argc, char *argv[])
 						goto out;
 
 					memcpy(tmpbuf, data, rc);
-					add_packet(tmpbuf, rc, packet->header.id, packet->header.seq, packet->header.eof);
+					add_packet(tmpbuf, rc, packet->header.id, packet->header.seq, packet->header.eof, 0);
 				}
 				if (eof)
 					break;
@@ -483,6 +584,10 @@ out:
 	}
 	if (sockfd > -1)
 		close(sockfd);
-
+	if (fp != NULL)
+		fclose(fp);
+	if (fname != NULL)
+		free(fname);
 	return 0;
 }
+
